@@ -1,0 +1,95 @@
+# Система «Охрана труда». Запуск: cp .env.example .env (задать секреты) && docker compose up -d --build
+# HTTPS (автоматический сертификат Let's Encrypt через Caddy): docker compose --profile https up -d
+name: ot
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ot}
+      POSTGRES_USER: ${POSTGRES_USER:-ot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Задайте POSTGRES_PASSWORD в .env}
+      TZ: ${APP_TIMEZONE:-Europe/Minsk}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgresql://${POSTGRES_USER:-ot}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-ot}?schema=public
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?Задайте JWT_ACCESS_SECRET}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?Задайте JWT_REFRESH_SECRET}
+      JWT_ACCESS_TTL: ${JWT_ACCESS_TTL:-15m}
+      JWT_REFRESH_TTL_DAYS: ${JWT_REFRESH_TTL_DAYS:-7}
+      CORS_ORIGINS: ${PUBLIC_URL:-http://localhost:8080}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      APP_TIMEZONE: ${APP_TIMEZONE:-Europe/Minsk}
+      UPLOAD_DIR: /app/storage/uploads
+      UPLOAD_MAX_MB: ${UPLOAD_MAX_MB:-10}
+      BACKUP_DIR: /app/storage/backups
+      SWAGGER_ENABLED: ${SWAGGER_ENABLED:-true}
+      LOGIN_MAX_ATTEMPTS: ${LOGIN_MAX_ATTEMPTS:-5}
+      LOGIN_LOCK_MINUTES: ${LOGIN_LOCK_MINUTES:-15}
+    volumes:
+      - uploads:/app/storage/uploads
+      - backups:/app/storage/backups
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    depends_on: [backend]
+    ports:
+      - "${HTTP_BIND:-127.0.0.1}:${HTTP_PORT:-8080}:80"
+
+  # Ежедневное резервное копирование БД с хранением BACKUP_KEEP_DAYS дней
+  backup:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGHOST: db
+      PGUSER: ${POSTGRES_USER:-ot}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB:-ot}
+      BACKUP_KEEP_DAYS: ${BACKUP_KEEP_DAYS:-30}
+      BACKUP_HOUR: ${BACKUP_HOUR:-02}
+      TZ: ${APP_TIMEZONE:-Europe/Minsk}
+    volumes:
+      - backups:/backups
+      - ./scripts/backup-loop.sh:/backup-loop.sh:ro
+    entrypoint: ["/bin/sh", "/backup-loop.sh"]
+
+  # Обратный прокси с HTTPS (включается профилем https; требуется DNS-имя DOMAIN и открытые порты 80/443)
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["https"]
+    restart: unless-stopped
+    depends_on: [frontend]
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+
+volumes:
+  db-data:
+  uploads:
+  backups:
+  caddy-data:

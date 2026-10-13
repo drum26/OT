@@ -9,7 +9,10 @@ export function configureApp(app: INestApplication) {
   exp.set('trust proxy', 1);
   exp.disable('x-powered-by');
   app.setGlobalPrefix('api');
-  app.use(helmet({ contentSecurityPolicy: { directives: { defaultSrc: ["'none'"], frameAncestors: ["'none'"] } } }));
+  // API отдаёт только JSON/файлы — максимально строгая CSP; для Swagger UI — политика, допускающая собственные скрипты
+  const apiHelmet = helmet({ contentSecurityPolicy: { directives: { defaultSrc: ["'none'"], frameAncestors: ["'none'"] } } });
+  const docsHelmet = helmet({ contentSecurityPolicy: { directives: { defaultSrc: ["'self'"], styleSrc: ["'self'", "'unsafe-inline'"], imgSrc: ["'self'", 'data:'], frameAncestors: ["'none'"] } } });
+  app.use((req: any, res: any, next: any) => (req.path.startsWith('/api/docs') ? docsHelmet : apiHelmet)(req, res, next));
   app.use(cookieParser());
   app.useGlobalPipes(new ValidationPipe({
     whitelist: true,
