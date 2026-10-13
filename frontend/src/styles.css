@@ -1,0 +1,16 @@
+html, body, #root { height: 100%; margin: 0; }
+body { background: #f3f5f4; }
+.page-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+.page-header h2 { margin: 0; font-size: 20px; font-weight: 600; }
+.filters { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+.filters > * { min-width: 160px; }
+.kpi { cursor: pointer; height: 100%; }
+.kpi:hover { box-shadow: 0 2px 8px rgba(0,0,0,.12); }
+.kpi .ant-statistic-title { min-height: 44px; }
+.row-overdue td { background: #fff1f0 !important; }
+.row-failed td { background: #fff0f6 !important; }
+.logo { color: #fff; font-weight: 600; font-size: 16px; padding: 16px; display: flex; gap: 8px; align-items: center; white-space: nowrap; overflow: hidden; }
+.muted { color: #888; }
+.cal-cell-item { font-size: 11px; line-height: 16px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+@media print { .ant-layout-sider, .ant-layout-header, .no-print { display: none !important; } }
+.ant-layout-content { min-width: 0; }
