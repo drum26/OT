@@ -1,0 +1,954 @@
+// Схема БД системы «Охрана труда».
+// Принципы:
+//  * календарные даты мероприятий хранятся как DATE (без времени и часового пояса);
+//  * моменты времени (создание/изменение/подтверждение) — TIMESTAMPTZ;
+//  * записи, имеющие контрольное/юридическое значение, не удаляются физически (onDelete: Restrict + статусы/архив);
+//  * нормативные сроки не зашиты в код — они хранятся в правилах с датами начала/окончания действия.
+
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x", "debian-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────────────────────── Пользователи и права ─────────────────────────────
+
+model User {
+  id                 String    @id @default(uuid()) @db.Uuid
+  login              String    @unique
+  passwordHash       String    @map("password_hash")
+  fullName           String    @map("full_name")
+  email              String?
+  isActive           Boolean   @default(true) @map("is_active")
+  /// Доступ ко всем подразделениям (иначе — только к перечисленным в user_unit_scopes и их дочерним)
+  allUnits           Boolean   @default(false) @map("all_units")
+  employeeId         String?   @unique @map("employee_id") @db.Uuid
+  failedLoginCount   Int       @default(0) @map("failed_login_count")
+  lockedUntil        DateTime? @map("locked_until") @db.Timestamptz(3)
+  lastLoginAt        DateTime? @map("last_login_at") @db.Timestamptz(3)
+  mustChangePassword Boolean   @default(false) @map("must_change_password")
+  createdAt          DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  employee      Employee?       @relation("UserEmployee", fields: [employeeId], references: [id], onDelete: SetNull)
+  roles         UserRole[]
+  unitScopes    UserUnitScope[]
+  refreshTokens RefreshToken[]
+  notifications Notification[]
+  tasksAssigned Task[]          @relation("TaskAssignee")
+
+  @@map("users")
+}
+
+model Role {
+  id          String           @id @default(uuid()) @db.Uuid
+  code        String           @unique
+  name        String
+  description String?
+  isSystem    Boolean          @default(false) @map("is_system")
+  createdAt   DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
+  permissions RolePermission[]
+  users       UserRole[]
+
+  @@map("roles")
+}
+
+model Permission {
+  id        String           @id @default(uuid()) @db.Uuid
+  code      String           @unique
+  name      String
+  groupName String           @map("group_name")
+  roles     RolePermission[]
+
+  @@map("permissions")
+}
+
+model RolePermission {
+  roleId       String     @map("role_id") @db.Uuid
+  permissionId String     @map("permission_id") @db.Uuid
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+model UserRole {
+  userId String @map("user_id") @db.Uuid
+  roleId String @map("role_id") @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role   Role   @relation(fields: [roleId], references: [id], onDelete: Restrict)
+
+  @@id([userId, roleId])
+  @@map("user_roles")
+}
+
+model UserUnitScope {
+  userId String             @map("user_id") @db.Uuid
+  unitId String             @map("unit_id") @db.Uuid
+  user   User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  unit   OrganizationalUnit @relation(fields: [unitId], references: [id], onDelete: Cascade)
+
+  @@id([userId, unitId])
+  @@map("user_unit_scopes")
+}
+
+model RefreshToken {
+  id         String    @id @default(uuid()) @db.Uuid
+  userId     String    @map("user_id") @db.Uuid
+  tokenHash  String    @unique @map("token_hash")
+  familyId   String    @map("family_id") @db.Uuid
+  expiresAt  DateTime  @map("expires_at") @db.Timestamptz(3)
+  revokedAt  DateTime? @map("revoked_at") @db.Timestamptz(3)
+  replacedBy String?   @map("replaced_by") @db.Uuid
+  ip         String?
+  userAgent  String?   @map("user_agent")
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([familyId])
+  @@map("refresh_tokens")
+}
+
+// ───────────────────────────── Оргструктура и сотрудники ─────────────────────────────
+
+model OrganizationalUnit {
+  id        String   @id @default(uuid()) @db.Uuid
+  code      String?  @unique
+  name      String
+  parentId  String?  @map("parent_id") @db.Uuid
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  parent     OrganizationalUnit?  @relation("UnitTree", fields: [parentId], references: [id], onDelete: Restrict)
+  children   OrganizationalUnit[] @relation("UnitTree")
+  employees  Employee[]
+  userScopes UserUnitScope[]
+
+  @@index([parentId])
+  @@map("organizational_units")
+}
+
+model Position {
+  id           String   @id @default(uuid()) @db.Uuid
+  code         String?  @unique
+  name         String   @unique
+  /// Категория работ (используется в правилах периодичности; значения задаются предприятием)
+  workCategory String?  @map("work_category")
+  isProfession Boolean  @default(false) @map("is_profession")
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  employees    Employee[]
+  ppeStandards PpeStandard[]
+
+  @@map("positions")
+}
+
+enum EmployeeStatus {
+  ACTIVE
+  ABSENT
+  DISMISSED
+}
+
+model Employee {
+  id              String         @id @default(uuid()) @db.Uuid
+  personnelNumber String         @unique @map("personnel_number")
+  lastName        String         @map("last_name")
+  firstName       String         @map("first_name")
+  middleName      String?        @map("middle_name")
+  unitId          String         @map("unit_id") @db.Uuid
+  positionId      String         @map("position_id") @db.Uuid
+  hireDate        DateTime       @map("hire_date") @db.Date
+  dismissalDate   DateTime?      @map("dismissal_date") @db.Date
+  status          EmployeeStatus @default(ACTIVE)
+  managerId       String?        @map("manager_id") @db.Uuid
+  phone           String?
+  email           String?
+  note            String?
+  createdAt       DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdById     String?        @map("created_by_id") @db.Uuid
+  updatedById     String?        @map("updated_by_id") @db.Uuid
+
+  unit     OrganizationalUnit @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  position Position           @relation(fields: [positionId], references: [id], onDelete: Restrict)
+  manager  Employee?          @relation("EmployeeManager", fields: [managerId], references: [id], onDelete: SetNull)
+  reports  Employee[]         @relation("EmployeeManager")
+  user     User?              @relation("UserEmployee")
+
+  history               EmployeeHistory[]
+  briefingParticipation BriefingParticipant[]
+  briefingsResponsible  Briefing[]                  @relation("BriefingResponsible")
+  checkParticipation    KnowledgeCheckParticipant[]
+  checksResponsible     KnowledgeCheck[]            @relation("CheckResponsible")
+  commissionMembership  CommissionMember[]
+  ppeIssues             PpeIssue[]
+
+  @@index([unitId])
+  @@index([positionId])
+  @@index([status])
+  @@index([lastName, firstName])
+  @@map("employees")
+}
+
+enum EmployeeChangeType {
+  HIRE
+  TRANSFER
+  UPDATE
+  STATUS_CHANGE
+  DISMISSAL
+  REHIRE
+  IMPORT_CREATE
+  IMPORT_UPDATE
+}
+
+model EmployeeHistory {
+  id             String             @id @default(uuid()) @db.Uuid
+  employeeId     String             @map("employee_id") @db.Uuid
+  changeType     EmployeeChangeType @map("change_type")
+  effectiveDate  DateTime           @map("effective_date") @db.Date
+  fromUnitId     String?            @map("from_unit_id") @db.Uuid
+  toUnitId       String?            @map("to_unit_id") @db.Uuid
+  fromPositionId String?            @map("from_position_id") @db.Uuid
+  toPositionId   String?            @map("to_position_id") @db.Uuid
+  /// Изменённые поля: { field: { from, to } }
+  changes        Json?
+  reason         String?
+  orderNumber    String?            @map("order_number")
+  authorId       String?            @map("author_id") @db.Uuid
+  createdAt      DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  employee Employee @relation(fields: [employeeId], references: [id], onDelete: Restrict)
+
+  @@index([employeeId, effectiveDate])
+  @@map("employee_history")
+}
+
+// ───────────────────────────── Документы по ОТ ─────────────────────────────
+
+enum SafetyDocumentType {
+  INSTRUCTION
+  PROGRAM
+  ORDER
+  REGULATION
+  OTHER
+}
+
+model SafetyDocument {
+  id           String             @id @default(uuid()) @db.Uuid
+  docType      SafetyDocumentType @default(INSTRUCTION) @map("doc_type")
+  number       String?
+  title        String
+  version      String?
+  approvedDate DateTime?          @map("approved_date") @db.Date
+  validFrom    DateTime?          @map("valid_from") @db.Date
+  validTo      DateTime?          @map("valid_to") @db.Date
+  isActive     Boolean            @default(true) @map("is_active")
+  note         String?
+  createdAt    DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime           @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  briefings Briefing[]
+
+  @@map("safety_documents")
+}
+
+// ───────────────────────────── Инструктажи ─────────────────────────────
+
+model BriefingType {
+  id                   String   @id @default(uuid()) @db.Uuid
+  code                 String   @unique
+  name                 String
+  description          String?
+  /// Периодический ли вид (срок следующего рассчитывается по правилам briefing_rules)
+  isPeriodic           Boolean  @default(false) @map("is_periodic")
+  /// Требуется ли фиксация подтверждения проведения у каждого участника
+  requiresConfirmation Boolean  @default(true) @map("requires_confirmation")
+  isActive             Boolean  @default(true) @map("is_active")
+  sortOrder            Int      @default(0) @map("sort_order")
+  createdAt            DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt            DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  rules     BriefingRule[]
+  briefings Briefing[]
+
+  @@map("briefing_types")
+}
+
+/// Правило периодичности инструктажа. Наиболее специфичное правило (должность > категория работ > подразделение > общее),
+/// действовавшее на дату проведения, определяет срок следующего инструктажа.
+model BriefingRule {
+  id              String    @id @default(uuid()) @db.Uuid
+  briefingTypeId  String    @map("briefing_type_id") @db.Uuid
+  positionId      String?   @map("position_id") @db.Uuid
+  workCategory    String?   @map("work_category")
+  unitId          String?   @map("unit_id") @db.Uuid
+  periodMonths    Int?      @map("period_months")
+  periodDays      Int?      @map("period_days")
+  /// Срок первичного прохождения (дней) после приёма или перевода; null — 0 (сразу)
+  initialDueDays  Int?      @map("initial_due_days")
+  /// Требуется повторное прохождение после перевода на другую должность/подразделение
+  resetOnTransfer Boolean   @default(false) @map("reset_on_transfer")
+  /// Основание (нормативный акт / локальный документ, пункт, редакция)
+  basis           String
+  validFrom       DateTime  @map("valid_from") @db.Date
+  validTo         DateTime? @map("valid_to") @db.Date
+  isActive        Boolean   @default(true) @map("is_active")
+  note            String?
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  briefingType BriefingType @relation(fields: [briefingTypeId], references: [id], onDelete: Restrict)
+
+  @@index([briefingTypeId])
+  @@map("briefing_rules")
+}
+
+enum EventStatus {
+  PLANNED
+  CONDUCTED
+  CANCELLED
+}
+
+model Briefing {
+  id                    String      @id @default(uuid()) @db.Uuid
+  briefingTypeId        String      @map("briefing_type_id") @db.Uuid
+  status                EventStatus @default(PLANNED)
+  plannedDate           DateTime?   @map("planned_date") @db.Date
+  conductedDate         DateTime?   @map("conducted_date") @db.Date
+  topic                 String?
+  reason                String?
+  documentId            String?     @map("document_id") @db.Uuid
+  responsibleEmployeeId String?     @map("responsible_employee_id") @db.Uuid
+  note                  String?
+  cancelReason          String?     @map("cancel_reason")
+  createdAt             DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt             DateTime    @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdById           String?     @map("created_by_id") @db.Uuid
+  updatedById           String?     @map("updated_by_id") @db.Uuid
+
+  briefingType BriefingType          @relation(fields: [briefingTypeId], references: [id], onDelete: Restrict)
+  document     SafetyDocument?       @relation(fields: [documentId], references: [id], onDelete: Restrict)
+  responsible  Employee?             @relation("BriefingResponsible", fields: [responsibleEmployeeId], references: [id], onDelete: Restrict)
+  participants BriefingParticipant[]
+
+  @@index([status, plannedDate])
+  @@index([conductedDate])
+  @@index([briefingTypeId])
+  @@map("briefings")
+}
+
+enum ParticipantResult {
+  PENDING
+  COMPLETED
+  NOT_COMPLETED
+  ABSENT
+}
+
+enum ConfirmationMethod {
+  PAPER_JOURNAL_SIGNATURE
+  SCANNED_DOCUMENT
+  ELECTRONIC
+  OTHER
+}
+
+model BriefingParticipant {
+  id                 String              @id @default(uuid()) @db.Uuid
+  briefingId         String              @map("briefing_id") @db.Uuid
+  employeeId         String              @map("employee_id") @db.Uuid
+  /// Подразделение и должность на момент мероприятия
+  unitId             String              @map("unit_id") @db.Uuid
+  positionId         String              @map("position_id") @db.Uuid
+  result             ParticipantResult   @default(PENDING)
+  confirmed          Boolean             @default(false)
+  confirmationMethod ConfirmationMethod? @map("confirmation_method")
+  confirmedAt        DateTime?           @map("confirmed_at") @db.Timestamptz(3)
+  confirmedById      String?             @map("confirmed_by_id") @db.Uuid
+  confirmationNote   String?             @map("confirmation_note")
+  nextDueDate        DateTime?           @map("next_due_date") @db.Date
+  nextDueRuleId      String?             @map("next_due_rule_id") @db.Uuid
+  note               String?
+  createdAt          DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  briefing Briefing @relation(fields: [briefingId], references: [id], onDelete: Restrict)
+  employee Employee @relation(fields: [employeeId], references: [id], onDelete: Restrict)
+
+  @@unique([briefingId, employeeId])
+  @@index([employeeId])
+  @@index([unitId])
+  @@map("briefing_participants")
+}
+
+// ───────────────────────────── Проверки знаний ─────────────────────────────
+
+model KnowledgeCheckType {
+  id          String   @id @default(uuid()) @db.Uuid
+  code        String   @unique
+  name        String
+  description String?
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  rules  KnowledgeCheckRule[]
+  checks KnowledgeCheck[]
+
+  @@map("knowledge_check_types")
+}
+
+/// Правило определения даты следующей проверки знаний.
+model KnowledgeCheckRule {
+  id              String    @id @default(uuid()) @db.Uuid
+  checkTypeId     String    @map("check_type_id") @db.Uuid
+  positionId      String?   @map("position_id") @db.Uuid
+  workCategory    String?   @map("work_category")
+  unitId          String?   @map("unit_id") @db.Uuid
+  periodMonths    Int?      @map("period_months")
+  periodDays      Int?      @map("period_days")
+  /// Срок первичного прохождения (дней) после приёма или перевода; null — 0 (сразу)
+  initialDueDays  Int?      @map("initial_due_days")
+  /// Требуется повторное прохождение после перевода на другую должность/подразделение
+  resetOnTransfer Boolean   @default(false) @map("reset_on_transfer")
+  /// Срок повторной проверки при неудовлетворительном результате (если установлен правилами)
+  retestDays      Int?      @map("retest_days")
+  basis           String
+  validFrom       DateTime  @map("valid_from") @db.Date
+  validTo         DateTime? @map("valid_to") @db.Date
+  isActive        Boolean   @default(true) @map("is_active")
+  note            String?
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  checkType KnowledgeCheckType @relation(fields: [checkTypeId], references: [id], onDelete: Restrict)
+
+  @@index([checkTypeId])
+  @@map("knowledge_check_rules")
+}
+
+model Commission {
+  id          String             @id @default(uuid()) @db.Uuid
+  name        String
+  orderNumber String?            @map("order_number")
+  orderDate   DateTime?          @map("order_date") @db.Date
+  isActive    Boolean            @default(true) @map("is_active")
+  createdAt   DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime           @updatedAt @map("updated_at") @db.Timestamptz(3)
+  members     CommissionMember[]
+  checks      KnowledgeCheck[]
+
+  @@map("commissions")
+}
+
+enum CommissionRole {
+  CHAIR
+  DEPUTY
+  MEMBER
+  SECRETARY
+}
+
+model CommissionMember {
+  id           String         @id @default(uuid()) @db.Uuid
+  commissionId String         @map("commission_id") @db.Uuid
+  employeeId   String         @map("employee_id") @db.Uuid
+  role         CommissionRole @default(MEMBER)
+  commission   Commission     @relation(fields: [commissionId], references: [id], onDelete: Cascade)
+  employee     Employee       @relation(fields: [employeeId], references: [id], onDelete: Restrict)
+
+  @@unique([commissionId, employeeId])
+  @@map("commission_members")
+}
+
+model KnowledgeCheck {
+  id                    String      @id @default(uuid()) @db.Uuid
+  checkTypeId           String      @map("check_type_id") @db.Uuid
+  status                EventStatus @default(PLANNED)
+  reason                String?
+  plannedDate           DateTime?   @map("planned_date") @db.Date
+  conductedDate         DateTime?   @map("conducted_date") @db.Date
+  commissionId          String?     @map("commission_id") @db.Uuid
+  responsibleEmployeeId String?     @map("responsible_employee_id") @db.Uuid
+  protocolNumber        String?     @map("protocol_number")
+  protocolDate          DateTime?   @map("protocol_date") @db.Date
+  note                  String?
+  cancelReason          String?     @map("cancel_reason")
+  createdAt             DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt             DateTime    @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdById           String?     @map("created_by_id") @db.Uuid
+  updatedById           String?     @map("updated_by_id") @db.Uuid
+
+  checkType    KnowledgeCheckType          @relation(fields: [checkTypeId], references: [id], onDelete: Restrict)
+  commission   Commission?                 @relation(fields: [commissionId], references: [id], onDelete: Restrict)
+  responsible  Employee?                   @relation("CheckResponsible", fields: [responsibleEmployeeId], references: [id], onDelete: Restrict)
+  participants KnowledgeCheckParticipant[]
+
+  @@index([status, plannedDate])
+  @@index([conductedDate])
+  @@map("knowledge_checks")
+}
+
+model KnowledgeCheckParticipant {
+  id         String   @id @default(uuid()) @db.Uuid
+  checkId    String   @map("check_id") @db.Uuid
+  employeeId String   @map("employee_id") @db.Uuid
+  unitId     String   @map("unit_id") @db.Uuid
+  positionId String   @map("position_id") @db.Uuid
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  check    KnowledgeCheck        @relation(fields: [checkId], references: [id], onDelete: Restrict)
+  employee Employee              @relation(fields: [employeeId], references: [id], onDelete: Restrict)
+  result   KnowledgeCheckResult?
+
+  @@unique([checkId, employeeId])
+  @@index([employeeId])
+  @@index([unitId])
+  @@map("knowledge_check_participants")
+}
+
+enum CheckOutcome {
+  PASSED
+  FAILED
+  ABSENT
+}
+
+model KnowledgeCheckResult {
+  id              String       @id @default(uuid()) @db.Uuid
+  participantId   String       @unique @map("participant_id") @db.Uuid
+  outcome         CheckOutcome
+  score           String?
+  nextCheckDate   DateTime?    @map("next_check_date") @db.Date
+  nextCheckRuleId String?      @map("next_check_rule_id") @db.Uuid
+  /// Дата следующей проверки задана вручную (с основанием)
+  nextCheckManual Boolean      @default(false) @map("next_check_manual")
+  nextCheckBasis  String?      @map("next_check_basis")
+  comment         String?
+  recordedById    String?      @map("recorded_by_id") @db.Uuid
+  createdAt       DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  participant KnowledgeCheckParticipant @relation(fields: [participantId], references: [id], onDelete: Restrict)
+
+  @@index([outcome])
+  @@index([nextCheckDate])
+  @@map("knowledge_check_results")
+}
+
+// ───────────────────────────── СИЗ ─────────────────────────────
+
+enum PpeSizeType {
+  NONE
+  CLOTHING
+  SHOES
+  HEAD
+  HANDS
+  RESPIRATORY
+  OTHER
+}
+
+enum RecordStatus {
+  ACTIVE
+  ARCHIVED
+}
+
+model PpeItem {
+  id                String       @id @default(uuid()) @db.Uuid
+  code              String?      @unique
+  name              String
+  category          String
+  model             String?
+  unit              String       @default("шт.")
+  sizeType          PpeSizeType  @default(NONE) @map("size_type")
+  characteristics   String?
+  /// Срок носки по умолчанию (мес.), если установлен; null — «до износа»/не календарный
+  defaultWearMonths Int?         @map("default_wear_months")
+  basis             String?
+  status            RecordStatus @default(ACTIVE)
+  createdAt         DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  standards PpeStandard[]
+  issues    PpeIssue[]
+  movements PpeStockMovement[]
+
+  @@index([name])
+  @@map("ppe_items")
+}
+
+model PpeStandard {
+  id            String    @id @default(uuid()) @db.Uuid
+  positionId    String    @map("position_id") @db.Uuid
+  ppeItemId     String    @map("ppe_item_id") @db.Uuid
+  quantity      Int
+  unit          String    @default("шт.")
+  /// Срок носки (мес.) если установлен; null — замена по износу/условию (см. wearCondition)
+  wearMonths    Int?      @map("wear_months")
+  wearCondition String?   @map("wear_condition")
+  basis         String
+  validFrom     DateTime  @map("valid_from") @db.Date
+  validTo       DateTime? @map("valid_to") @db.Date
+  note          String?
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  position Position   @relation(fields: [positionId], references: [id], onDelete: Restrict)
+  ppeItem  PpeItem    @relation(fields: [ppeItemId], references: [id], onDelete: Restrict)
+  issues   PpeIssue[]
+
+  @@index([positionId])
+  @@index([ppeItemId])
+  @@map("ppe_standards")
+}
+
+enum PpeIssueStatus {
+  ACTIVE
+  PARTIALLY_CLOSED
+  RETURNED
+  WRITTEN_OFF
+  REPLACED
+}
+
+model PpeIssue {
+  id                     String              @id @default(uuid()) @db.Uuid
+  employeeId             String              @map("employee_id") @db.Uuid
+  ppeItemId              String              @map("ppe_item_id") @db.Uuid
+  standardId             String?             @map("standard_id") @db.Uuid
+  unitId                 String              @map("unit_id") @db.Uuid
+  positionId             String              @map("position_id") @db.Uuid
+  quantity               Int
+  issueDate              DateTime            @map("issue_date") @db.Date
+  size                   String?
+  wearMonths             Int?                @map("wear_months")
+  plannedReplacementDate DateTime?           @map("planned_replacement_date") @db.Date
+  /// Плановая дата замены скорректирована вручную
+  replacementManual      Boolean             @default(false) @map("replacement_manual")
+  replacementBasis       String?             @map("replacement_basis")
+  issuedById             String?             @map("issued_by_id") @db.Uuid
+  issuerName             String?             @map("issuer_name")
+  /// Подтверждение фактического получения (не выставляется автоматически)
+  receiptConfirmed       Boolean             @default(false) @map("receipt_confirmed")
+  receiptConfirmedAt     DateTime?           @map("receipt_confirmed_at") @db.Timestamptz(3)
+  receiptConfirmedById   String?             @map("receipt_confirmed_by_id") @db.Uuid
+  receiptMethod          ConfirmationMethod? @map("receipt_method")
+  basis                  String?
+  note                   String?
+  status                 PpeIssueStatus      @default(ACTIVE)
+  replacesIssueId        String?             @map("replaces_issue_id") @db.Uuid
+  createdAt              DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt              DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  employee Employee     @relation(fields: [employeeId], references: [id], onDelete: Restrict)
+  ppeItem  PpeItem      @relation(fields: [ppeItemId], references: [id], onDelete: Restrict)
+  standard PpeStandard? @relation(fields: [standardId], references: [id], onDelete: Restrict)
+  returns  PpeReturn[]
+
+  @@index([employeeId])
+  @@index([ppeItemId])
+  @@index([status, plannedReplacementDate])
+  @@map("ppe_issues")
+}
+
+enum PpeReturnType {
+  RETURN
+  WRITE_OFF
+  REPLACEMENT
+}
+
+model PpeReturn {
+  id            String        @id @default(uuid()) @db.Uuid
+  issueId       String        @map("issue_id") @db.Uuid
+  operationType PpeReturnType @map("operation_type")
+  quantity      Int
+  operationDate DateTime      @map("operation_date") @db.Date
+  reason        String
+  /// Возвращено на склад (увеличивает остаток)
+  toStock       Boolean       @default(false) @map("to_stock")
+  createdById   String?       @map("created_by_id") @db.Uuid
+  createdAt     DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  issue PpeIssue @relation(fields: [issueId], references: [id], onDelete: Restrict)
+
+  @@index([issueId])
+  @@map("ppe_returns")
+}
+
+enum StockMovementType {
+  RECEIPT
+  ISSUE
+  RETURN
+  WRITE_OFF
+  ADJUSTMENT
+}
+
+model PpeStockMovement {
+  id           String            @id @default(uuid()) @db.Uuid
+  ppeItemId    String            @map("ppe_item_id") @db.Uuid
+  size         String?
+  /// Знаковое количество: приход > 0, расход < 0
+  quantity     Int
+  movementType StockMovementType @map("movement_type")
+  movementDate DateTime          @map("movement_date") @db.Date
+  issueId      String?           @map("issue_id") @db.Uuid
+  returnId     String?           @map("return_id") @db.Uuid
+  document     String?
+  note         String?
+  createdById  String?           @map("created_by_id") @db.Uuid
+  createdAt    DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  ppeItem PpeItem @relation(fields: [ppeItemId], references: [id], onDelete: Restrict)
+
+  @@index([ppeItemId, size])
+  @@map("ppe_stock_movements")
+}
+
+// ───────────────────────────── Задачи и уведомления ─────────────────────────────
+
+enum TaskType {
+  MANUAL
+  CONTROL_EVENT
+  AUTO_BRIEFING
+  AUTO_CHECK
+  AUTO_PPE
+}
+
+enum TaskStatus {
+  OPEN
+  IN_PROGRESS
+  DONE
+  CANCELLED
+}
+
+enum TaskPriority {
+  LOW
+  NORMAL
+  HIGH
+  CRITICAL
+}
+
+model Task {
+  id             String       @id @default(uuid()) @db.Uuid
+  title          String
+  description    String?
+  taskType       TaskType     @default(MANUAL) @map("task_type")
+  status         TaskStatus   @default(OPEN)
+  priority       TaskPriority @default(NORMAL)
+  dueDate        DateTime?    @map("due_date") @db.Date
+  assigneeUserId String?      @map("assignee_user_id") @db.Uuid
+  unitId         String?      @map("unit_id") @db.Uuid
+  entityType     String?      @map("entity_type")
+  entityId       String?      @map("entity_id") @db.Uuid
+  /// Ключ идемпотентности для автоматически созданных задач
+  sourceKey      String?      @unique @map("source_key")
+  result         String?
+  completedAt    DateTime?    @map("completed_at") @db.Timestamptz(3)
+  createdById    String?      @map("created_by_id") @db.Uuid
+  createdAt      DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  assignee User? @relation("TaskAssignee", fields: [assigneeUserId], references: [id], onDelete: SetNull)
+
+  @@index([status, dueDate])
+  @@index([assigneeUserId])
+  @@map("tasks")
+}
+
+enum NotificationEventType {
+  BRIEFING_PLANNED
+  KNOWLEDGE_CHECK_PLANNED
+  PPE_REPLACEMENT
+  TASK_DUE
+  BRIEFING_COMPLIANCE_DIGEST
+  CHECK_COMPLIANCE_DIGEST
+}
+
+model NotificationRule {
+  id                      String                @id @default(uuid()) @db.Uuid
+  eventType               NotificationEventType @unique @map("event_type")
+  name                    String
+  /// За сколько дней до срока уведомлять (несколько значений)
+  daysBefore              Int[]                 @map("days_before")
+  notifyOnDueDate         Boolean               @default(true) @map("notify_on_due_date")
+  notifyOverdue           Boolean               @default(true) @map("notify_overdue")
+  notifyResponsible       Boolean               @default(true) @map("notify_responsible")
+  notifyUnitHeads         Boolean               @default(true) @map("notify_unit_heads")
+  notifySafetySpecialists Boolean               @default(true) @map("notify_safety_specialists")
+  createTaskOnOverdue     Boolean               @default(false) @map("create_task_on_overdue")
+  channels                String[]              @default(["IN_APP"])
+  isActive                Boolean               @default(true) @map("is_active")
+  updatedAt               DateTime              @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@map("notification_rules")
+}
+
+model Notification {
+  id         String                 @id @default(uuid()) @db.Uuid
+  userId     String                 @map("user_id") @db.Uuid
+  eventType  NotificationEventType? @map("event_type")
+  title      String
+  message    String
+  link       String?
+  entityType String?                @map("entity_type")
+  entityId   String?                @map("entity_id")
+  /// Ключ идемпотентности: повторный запуск фоновых заданий не создаёт дубликатов
+  dedupeKey  String                 @map("dedupe_key")
+  readAt     DateTime?              @map("read_at") @db.Timestamptz(3)
+  createdAt  DateTime               @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user       User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deliveries NotificationDelivery[]
+
+  @@unique([userId, dedupeKey])
+  @@index([userId, readAt])
+  @@map("notifications")
+}
+
+enum DeliveryStatus {
+  PENDING
+  SENT
+  FAILED
+  SKIPPED
+}
+
+model NotificationDelivery {
+  id             String         @id @default(uuid()) @db.Uuid
+  notificationId String         @map("notification_id") @db.Uuid
+  channel        String
+  status         DeliveryStatus @default(PENDING)
+  attempts       Int            @default(0)
+  lastError      String?        @map("last_error")
+  sentAt         DateTime?      @map("sent_at") @db.Timestamptz(3)
+  createdAt      DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  notification Notification @relation(fields: [notificationId], references: [id], onDelete: Cascade)
+
+  @@unique([notificationId, channel])
+  @@index([status])
+  @@map("notification_deliveries")
+}
+
+// ───────────────────────────── Файлы, шаблоны, журнал, настройки, импорт ─────────────────────────────
+
+model Attachment {
+  id           String    @id @default(uuid()) @db.Uuid
+  entityType   String    @map("entity_type")
+  entityId     String    @map("entity_id") @db.Uuid
+  originalName String    @map("original_name")
+  storedName   String    @unique @map("stored_name")
+  mimeType     String    @map("mime_type")
+  size         Int
+  sha256       String
+  description  String?
+  uploadedById String?   @map("uploaded_by_id") @db.Uuid
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  archivedAt   DateTime? @map("archived_at") @db.Timestamptz(3)
+
+  @@index([entityType, entityId])
+  @@map("attachments")
+}
+
+model DocumentTemplate {
+  id         String    @id @default(uuid()) @db.Uuid
+  code       String
+  name       String
+  /// HTML-шаблон Handlebars (значения экранируются автоматически)
+  content    String
+  version    Int       @default(1)
+  isActive   Boolean   @default(true) @map("is_active")
+  /// Соответствие обязательным требованиям проверено ответственным лицом
+  isVerified Boolean   @default(false) @map("is_verified")
+  verifiedBy String?   @map("verified_by")
+  verifiedAt DateTime? @map("verified_at") @db.Timestamptz(3)
+  basis      String?
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt  DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([code, version])
+  @@map("document_templates")
+}
+
+model AuditLog {
+  id         BigInt   @id @default(autoincrement())
+  userId     String?  @map("user_id") @db.Uuid
+  userLogin  String?  @map("user_login")
+  action     String
+  entityType String?  @map("entity_type")
+  entityId   String?  @map("entity_id")
+  method     String?
+  path       String?
+  ip         String?
+  success    Boolean  @default(true)
+  details    Json?
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([createdAt])
+  @@index([entityType, entityId])
+  @@index([userId])
+  @@map("audit_logs")
+}
+
+model SystemSetting {
+  key         String   @id
+  value       Json
+  description String?
+  updatedById String?  @map("updated_by_id") @db.Uuid
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@map("system_settings")
+}
+
+enum ImportType {
+  EMPLOYEES
+  PPE_ITEMS
+  PPE_STANDARDS
+}
+
+enum ImportStatus {
+  PREVIEW
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+model ImportJob {
+  id           String        @id @default(uuid()) @db.Uuid
+  importType   ImportType    @map("import_type")
+  status       ImportStatus  @default(PREVIEW)
+  fileName     String        @map("file_name")
+  totalRows    Int           @default(0) @map("total_rows")
+  validRows    Int           @default(0) @map("valid_rows")
+  createdCount Int           @default(0) @map("created_count")
+  updatedCount Int           @default(0) @map("updated_count")
+  skippedCount Int           @default(0) @map("skipped_count")
+  errorCount   Int           @default(0) @map("error_count")
+  /// Разобранные и проверенные строки (для подтверждения импорта)
+  payload      Json?
+  options      Json?
+  message      String?
+  createdById  String?       @map("created_by_id") @db.Uuid
+  createdAt    DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  completedAt  DateTime?     @map("completed_at") @db.Timestamptz(3)
+  errors       ImportError[]
+
+  @@map("import_jobs")
+}
+
+model ImportError {
+  id        String    @id @default(uuid()) @db.Uuid
+  jobId     String    @map("job_id") @db.Uuid
+  rowNumber Int       @map("row_number")
+  field     String?
+  value     String?
+  message   String
+  job       ImportJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@index([jobId])
+  @@map("import_errors")
+}
