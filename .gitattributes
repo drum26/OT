@@ -1,0 +1,6 @@
+# Скрипты для контейнеров Linux должны иметь окончания строк LF (иначе ошибка запуска на Windows)
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.conf text eol=lf
+Caddyfile text eol=lf
+.env.example text eol=lf
