@@ -43,6 +43,47 @@ Caddy получает и продлевает сертификат автома
 Порядок проверен на тестовом стенде: копия → изменение данных → восстановление → изменение отменено,
 учётные записи и вход сохранены.
 
+## Перенос на другой компьютер
+
+Пользователям (клиентам) ничего устанавливать не нужно — достаточно браузера и адреса сервера.
+Ниже — перенос самого сервера системы. Команды одинаково работают в PowerShell, macOS и Linux
+(перенаправление `<` не используется).
+
+**На старом компьютере** (в папке проекта, система запущена):
+```
+docker compose exec db sh -c 'pg_dump --format=custom --no-owner -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f /tmp/ot.dump'
+docker compose cp db:/tmp/ot.dump ./ot.dump
+docker compose cp backend:/app/storage/uploads ./uploads
+```
+Перенесите на новый компьютер файл `ot.dump`, папку `uploads` и (при желании) файл `.env`.
+
+**На новом компьютере**: установите Docker, скачайте проект, создайте `.env` (см. INSTALL.md), затем:
+```
+docker compose up -d --build
+docker compose stop backend
+docker compose cp ./ot.dump db:/tmp/ot.dump
+docker compose exec db sh -c 'pg_restore --clean --if-exists --no-owner -U "$POSTGRES_USER" -d "$POSTGRES_DB" /tmp/ot.dump'
+docker compose start backend
+docker compose cp ./uploads/. backend:/app/storage/uploads
+docker compose exec -u root backend chown -R ot:ot /app/storage/uploads
+```
+Пароль базы в `.env` нового компьютера может отличаться — данные и учётные записи пользователей переносятся
+вместе с копией. Если JWT-секреты новые, пользователям нужно просто войти заново.
+Администратора заново создавать не нужно. Порядок проверен: данные из копии восстанавливаются на сервере
+с другим паролем БД.
+
+**Компьютер без доступа в интернет.** На компьютере с интернетом соберите и сохраните образы:
+```
+docker compose build
+docker save -o ot-images.tar ot-backend ot-frontend postgres:16-alpine
+```
+Перенесите `ot-images.tar` и папку проекта, затем на целевом компьютере:
+```
+docker load -i ot-images.tar
+docker compose up -d --no-build db backend frontend
+```
+(сервис `backup` использует тот же образ PostgreSQL и тоже может быть запущен: добавьте `backup` в список.)
+
 ## Обновление системы
 
 ```bash
