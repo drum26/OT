@@ -84,9 +84,33 @@ services:
     ports:
       - "80:80"
       - "443:443"
+    networks:
+      default:
+        ipv4_address: 10.250.77.10
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
+
+  # Доступ из интернета через Cloudflare Tunnel (без проброса портов и «белого» IP).
+  # Включение: CLOUDFLARE_TUNNEL_TOKEN в .env и docker compose --profile tunnel up -d
+  cloudflared:
+    image: cloudflare/cloudflared:2026.9.3
+    profiles: ["tunnel"]
+    restart: unless-stopped
+    depends_on: [frontend]
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    networks:
+      default:
+        ipv4_address: 10.250.77.11
+
+# Фиксированная подсеть: nginx доверяет заголовку X-Forwarded-For только от адресов Caddy и cloudflared
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 10.250.77.0/24
 
 volumes:
   db-data:
